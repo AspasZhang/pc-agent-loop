@@ -271,6 +271,27 @@ class GenericAgentHandler(BaseHandler):
     def _extract_code_block(self, response, code_type):
         matches = re.findall(rf"```{code_type}\n(.*?)\n```", response.content, re.DOTALL)
         return matches[-1].strip() if matches else None
+    
+    def _is_in_plan_mode(self):
+        """统一的plan模式检测逻辑"""
+        return self.working.get('in_plan_mode', False) or \
+               ('plan_sop' in (self.working.get('related_sop') or ''))
+    
+    def _check_plan_completion(self):
+        """检查plan.md是否完成，返回剩余任务数。失败返回None"""
+        try:
+            plan_path = os.path.join(self.cwd, 'plan.md')
+            if not os.path.isfile(plan_path):
+                return None
+            with open(plan_path, 'r', encoding='utf-8') as f:
+                return len(re.findall(r'\[ \]', f.read()))
+        except Exception:
+            return None
+    
+    def _exit_plan_mode(self):
+        """退出plan模式，清理相关状态"""
+        self.working['in_plan_mode'] = False
+        self.working.pop('related_sop', None)
 
     def do_code_run(self, args, response):
         '''执行代码片段，有长度限制，不允许代码中放大量数据，如有需要应当通过文件读取进行。'''
@@ -419,6 +440,10 @@ class GenericAgentHandler(BaseHandler):
         related_sop = args.get("related_sop", "")
         if "key_info" in args: self.working['key_info'] = key_info
         if "related_sop" in args: self.working['related_sop'] = related_sop
+        # P0-1: plan模式一旦激活就持久化，不因related_sop变更而丢失
+        if 'plan_sop' in related_sop:
+            self.working['in_plan_mode'] = True
+            self.max_turns = max(getattr(self, 'max_turns', 40), 80)  # plan模式需要更多轮次
         self.working['passed_sessions'] = 0
         yield f"[Info] Updated key_info and related_sop.\n"
         next_prompt = self._get_anchor_prompt(skip=args.get('_index', 0) > 0)
@@ -437,6 +462,11 @@ class GenericAgentHandler(BaseHandler):
             return StepOutcome({}, next_prompt="[System] Incomplete response. Regenerate and tooluse.")
         if 'max_tokens !!!]' in content[-100:]:
             return StepOutcome({}, next_prompt="[System] max_tokens limit reached. Use multi small steps to do it.")
+        # P0-2: plan模式下声称完成但未执行验证时，强制拦截
+        if self._is_in_plan_mode() and any(kw in content for kw in ['任务完成', '全部完成', '已完成所有', '🏁']):
+            if 'VERDICT' not in content and '[VERIFY]' not in content and '验证subagent' not in content:
+                yield "[Warn] Plan模式完成声明拦截。\n"
+                return StepOutcome({}, next_prompt="⛔ [验证拦截] 检测到你在plan模式下声称完成，但未执行[VERIFY]验证步骤。请先按plan_sop §四启动验证subagent，获得VERDICT后才能声称完成。")
         # 2. 检测“包含较大代码块但未调用工具”的情况
         # 这里通过三引号代码块 + 最少字符数的方式粗略判断“大段代码”
         code_block_pattern = r"```[a-zA-Z0-9_]*\n[\s\S]{300,}?```"
@@ -460,7 +490,13 @@ class GenericAgentHandler(BaseHandler):
                     "并明确是否还需要额外的实际操作。"
                 )
                 return StepOutcome({}, next_prompt=next_prompt)
-        # 3. 正常情况：直接将回复返回给用户并结束循环
+        # 3. plan模式退出检查：plan.md中0个[ ]残留时清除plan标志
+        if self._is_in_plan_mode():
+            remaining = self._check_plan_completion()
+            if remaining == 0:
+                self._exit_plan_mode()
+                yield "[Info] Plan完成：plan.md中0个[ ]残留，退出plan模式。\n"
+        # 4. 正常情况：直接将回复返回给用户并结束循环
         yield "[Info] Final response to user.\n"
         return StepOutcome(response, next_prompt=None)
     
@@ -504,11 +540,21 @@ class GenericAgentHandler(BaseHandler):
             next_prompt += "\n[DANGER] 上一轮遗漏了<summary>，已根据物理动作自动补全。在下次回复中记得<summary>协议。" 
         summary = smart_format(summary, max_str_len=100)
         self.history_info.append(f'[Agent] {summary}')
-        if turn % 35 == 0 and 'plan' not in str(self.working.get('related_sop')):
+
+    def next_prompt_patcher(self, next_prompt, outcome, turn):
+        # 使用统一的plan模式检测
+        _plan = self._is_in_plan_mode()
+        
+        if turn % 35 == 0 and not _plan:
             next_prompt += f"\n\n[DANGER] 已连续执行第 {turn} 轮。你必须总结情况进行ask_user，不允许继续重试。"
         elif turn % 7 == 0:
             next_prompt += f"\n\n[DANGER] 已连续执行第 {turn} 轮。禁止无效重试。若无有效进展，必须切换策略：1. 探测物理边界 2. 请求用户协助。如有需要，可调用 update_working_checkpoint 保存关键上下文。"
         elif turn % 10 == 0: next_prompt += get_global_memory()
+        
+        if _plan and turn >= 10 and turn % 5 == 0:
+            next_prompt = "[Plan提醒] 你正在计划模式。必须 file_read(plan.md) 确认当前步骤，回复开头引用：📌 当前步骤：...\n\n" + next_prompt
+        if _plan and turn >= 70:
+            next_prompt += f"\n\n[DANGER] Plan模式已运行 {turn} 轮，已达上限。必须 ask_user 汇报进度并确认是否继续。"
         injkeyinfo = consume_file(self.parent.task_dir, '_keyinfo')
         injprompt = consume_file(self.parent.task_dir, '_intervene')
         if injkeyinfo: self.working['key_info'] = self.working.get('key_info', '') + f"\n[MASTER] {injkeyinfo}"
