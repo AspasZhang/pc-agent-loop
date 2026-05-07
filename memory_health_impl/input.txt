@@ -1,0 +1,1 @@
+你是实现 subagent。第一步必须读取 /Users/zhangzhoujia/Desktop/pc-agent-loop/temp/plan_memory_health/context.json，然后按其中 plan.md 实现 memory 体系自动健康检查工具。任务多步骤，建议内部使用 plan_mode。注意：默认只读、不读取密钥文件内容；谨慎 patch L1 且保持 <=30 行；完成后运行计划中的自测并汇报交付物、命令、退出码、遗留 warning。
