@@ -419,10 +419,25 @@ class GenericAgentHandler(BaseHandler):
         return StepOutcome(result, next_prompt=next_prompt)
     
     def _in_plan_mode(self): return self.working.get('in_plan_mode')
-    def _exit_plan_mode(self): self.working.pop('in_plan_mode', None)
+    def _exit_plan_mode(self): self.working.pop('in_plan_mode', None); self.working.pop('plan_phase', None)
     def enter_plan_mode(self, plan_path): 
-        self.working['in_plan_mode'] = plan_path; self.max_turns = 100
-        print(f"[Info] Entered plan mode with plan file: {plan_path}"); return plan_path
+        os.makedirs(os.path.dirname(plan_path) or '.', exist_ok=True)
+        self.working['in_plan_mode'] = plan_path
+        self.working['plan_phase'] = 'EXPLORE'
+        self.max_turns = 100
+        return (f"✅ Plan模式已激活 | plan: {plan_path} | 阶段: EXPLORE\n"
+                "下一步：启动探索subagent（只读探测环境）→ 收到findings后写plan\n"
+                "⛔ 当前禁止：写plan.md | 执行业务任务 | 自己探测环境")
+
+    def set_plan_phase(self, phase):
+        valid = ('EXPLORE', 'PLAN', 'EXEC', 'VERIFY')
+        if phase not in valid: return f"❌ 无效阶段，可选: {valid}"
+        self.working['plan_phase'] = phase
+        hints = {'EXPLORE': '启动/监察探索subagent',
+                 'PLAN': '按模板写plan.md → ask_user确认',
+                 'EXEC': '你是监察者，只启动/监察subagent，禁止自己执行',
+                 'VERIFY': '启动验证subagent → 确认VERDICT'}
+        return f"✅ 阶段切换: {phase} | 下一步: {hints[phase]}"
     def _check_plan_completion(self):
         if not os.path.isfile(p:=self._in_plan_mode() or ''): return None
         try: return len(re.findall(r'\[ \]', open(p, encoding='utf-8', errors='replace').read()))
@@ -487,7 +502,13 @@ class GenericAgentHandler(BaseHandler):
         if self._in_plan_mode():
             remaining = self._check_plan_completion()
             if remaining == 0:
-                self._exit_plan_mode(); yield "[Info] Plan完成：plan.md中0个[ ]残留，退出plan模式。\n"
+                phase = self.working.get('plan_phase', '')
+                if phase != 'VERIFY':
+                    self.working['plan_phase'] = 'VERIFY'
+                    yield "[Info] Plan所有步骤已完成，自动进入VERIFY阶段。请启动验证subagent。\n"
+                    return StepOutcome({}, next_prompt="⛔ [自动切换] 阶段→VERIFY | 启动验证subagent确认VERDICT后才能退出plan模式。")
+                else:
+                    self._exit_plan_mode(); yield "[Info] Plan完成且已验证，退出plan模式。\n"
         
         yield "[Info] Final response to user.\n"
         return StepOutcome(response, next_prompt=None)
@@ -556,8 +577,16 @@ class GenericAgentHandler(BaseHandler):
             next_prompt += f"\n\n[DANGER] 已连续执行第 {turn} 轮。禁止无效重试。若无有效进展，必须切换策略：1. 探测物理边界 2. 请求用户协助。如有需要，可调用 update_working_checkpoint 保存关键上下文。"
         elif turn % 10 == 0: next_prompt += get_global_memory()
 
-        if _plan and turn >= 10 and turn % 5 == 0:
-            next_prompt = f"[Plan Hint] 正在计划模式。必须 file_read({_plan}) 确认当前步骤，回复开头引用：📌 当前步骤：...\n\n" + next_prompt
+        if _plan and turn >= 3 and turn % 3 == 0:
+            phase = self.working.get('plan_phase', '')
+            phase_hints = {
+                'EXPLORE': f"阶段EXPLORE | 你应该在监察探索subagent | ⛔禁止自己探测/写plan/执行",
+                'PLAN': f"阶段PLAN | 按模板写{_plan} → ask_user确认 | ⛔禁止执行业务任务",
+                'EXEC': f"阶段EXEC | 你是监察者 | file_read({_plan})找下一个[ ] → 启动subagent | ⛔禁止自己写业务代码",
+                'VERIFY': f"阶段VERIFY | 启动验证subagent → 等VERDICT | ⛔禁止自己验证",
+            }
+            hint = phase_hints.get(phase, f"必须 file_read({_plan}) 确认当前步骤")
+            next_prompt = f"[Plan Hint] 📌 {hint}\n\n" + next_prompt
         if _plan and turn >= 90: next_prompt += f"\n\n[DANGER] Plan模式已运行 {turn} 轮，已达上限。必须 ask_user 汇报进度并确认是否继续。"
 
         injkeyinfo = consume_file(self.parent.task_dir, '_keyinfo')
